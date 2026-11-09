@@ -1,0 +1,4 @@
+segno>=1.6.0
+zxing-cpp>=2.2.0
+pillow>=10.0.0
+pyinstaller>=6.0.0
