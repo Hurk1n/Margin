@@ -1,221 +1,138 @@
 # -*- coding: utf-8 -*-
-"""Margin GUI —— 深色卡片风格，生成中心带像素图案的二维码。"""
+"""Margin desktop editor: text, installed fonts, and image art."""
 from __future__ import annotations
 
 import os
 import sys
-from tkinter import StringVar, DoubleVar, IntVar, filedialog
+import threading
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 import tkinter as tk
-from tkinter import ttk
-from tkinter import font as tkfont
+from tkinter import ttk, filedialog
 
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageTk, ImageOps
 
-from . import core
+from . import core, fonts, svg
+from .art import ImageOptions
 
-# ---- 设计令牌 ----
-BG = "#09090B"
-CARD = "#18181B"
-FIELD = "#111113"
-STROKE = "#27272A"
-STROKE_STRONG = "#3F3F46"
-TEXT = "#FAFAFA"
-SUB = "#A1A1AA"
-ACCENT = "#6366F1"
-ACCENT_HOVER = "#4F46E5"
-OK = "#4ADE80"
-WARN = "#FCA5A5"
-
-W, H = 960, 752
-PREVIEW = 380
-
-FONT_CHOICES = [
-    ("微软雅黑 粗体", r"C:\Windows\Fonts\msyhbd.ttc"),
-    ("微软雅黑", r"C:\Windows\Fonts\msyh.ttc"),
-    ("黑体", r"C:\Windows\Fonts\simhei.ttf"),
-    ("Arial 粗体", r"C:\Windows\Fonts\arialbd.ttf"),
-    ("Consolas 粗体", r"C:\Windows\Fonts\consolab.ttf"),
-    ("Segoe UI 半粗", r"C:\Windows\Fonts\seguisb.ttf"),
-]
+BG, CARD, FIELD = "#09090B", "#18181B", "#111113"
+STROKE, TEXT, SUB = "#27272A", "#FAFAFA", "#A1A1AA"
+ACCENT, OK, WARN = "#6366F1", "#4ADE80", "#FCA5A5"
 
 
-def resource_path(*parts) -> str:
-    base = getattr(sys, "_MEIPASS", None)
-    if base is None:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, *parts)
+def resource_path(*parts):
+    return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(__file__))), *parts)
 
 
-def rounded_polygon(cv: tk.Canvas, x1, y1, x2, y2, r, **kw):
-    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-           x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-           x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-    return cv.create_polygon(pts, smooth=True, **kw)
+class NumberControl(ttk.Frame):
+    """A precise text field and a stepped slider sharing one value."""
 
+    def __init__(self, parent, label, variable, low, high, step, *, enabled=None):
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self.variable, self.low, self.high, self.step = variable, low, high, step
+        self._syncing = False
+        self._position = tk.DoubleVar(value=low)
+        ttk.Label(self, text=label, style="Sub.TLabel").grid(row=0, column=0, sticky="w")
+        self.entry = ttk.Entry(self, textvariable=variable, width=8, justify="right")
+        self.entry.grid(row=0, column=1, sticky="e", padx=(10, 0))
+        self.slider = ttk.Scale(self, from_=low, to=high, variable=self._position,
+                                 command=self._from_slider)
+        self.slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        for key, direction in (("Left", -1), ("Down", -1), ("Right", 1), ("Up", 1)):
+            self.slider.bind(f"<{key}>", lambda event, d=direction: self._keyboard_step(d))
+        self._trace = variable.trace_add("write", self._from_entry)
+        self._enabled = enabled
+        self._enabled_trace = enabled.trace_add("write", self._update_enabled) if enabled is not None else None
+        self._from_entry()
+        self._update_enabled()
+        self.bind("<Destroy>", self._cleanup)
 
-def rounded_image(img: Image.Image, radius: int) -> Image.Image:
-    img = img.convert("RGBA")
-    w, h = img.size
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
-    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    out.paste(img, (0, 0), mask)
-    return out
+    def _from_slider(self, value):
+        if self._syncing:
+            return
+        number = round(float(value) / self.step) * self.step
+        number = max(self.low, min(self.high, number))
+        self.variable.set(int(round(number)) if self.step >= 1 else round(number, 2))
 
-
-class Pill(tk.Canvas):
-    """自绘圆角按钮。"""
-
-    def __init__(self, master, text, command, kind="ghost", width=None,
-                 height=38, font=("Microsoft YaHei UI", 10)):
-        self.kind = kind
-        self.font = font
-        self.command = command
-        self._text = text
-        tmp = tkfont.Font(font=self.font)
-        w = width or (tmp.measure(text) + 42)
-        super().__init__(master, width=w, height=height, bg=BG,
-                         highlightthickness=0, bd=0, cursor="hand2")
-        self._bw, self._bh = w, height
-        self._paint()
-
-    def _colors(self, state):
-        if self.kind == "primary":
-            return (ACCENT_HOVER if state == "hover" else ACCENT,
-                    ACCENT_HOVER if state == "hover" else ACCENT, "#FFFFFF")
-        if state == "hover":
-            return (STROKE, STROKE_STRONG, TEXT)
-        return (CARD, STROKE, TEXT)
-
-    def _paint(self, state="idle"):
-        self.delete("all")
-        fill, edge, fg = self._colors(state)
-        rounded_polygon(self, 1, 1, self._bw - 1, self._bh - 1, 9,
-                        fill=fill, outline=edge, width=1)
-        self.create_text(self._bw / 2, self._bh / 2, text=self._text,
-                         fill=fg, font=self.font)
-
-    def _bind_events(self):
-        self.bind("<Enter>", lambda e: self._paint("hover"))
-        self.bind("<Leave>", lambda e: self._paint("idle"))
-        self.bind("<Button-1>", lambda e: self._paint("press"))
-        self.bind("<ButtonRelease-1>", self._click)
-
-    def _click(self, event):
-        self._paint("hover")
-        if self.command:
-            self.command()
-
-
-
-class MiniSlider(tk.Canvas):
-    """自绘滑块：圆角轨道 + 圆点手柄。"""
-
-    PAD = 8
-    CY = 12
-
-    def __init__(self, master, width=110, var=None, lo=0.0, hi=1.0, jump=1.0,
-                 command=None, bg=CARD):
-        super().__init__(master, width=width, height=24, bg=bg,
-                         highlightthickness=0, bd=0, cursor="hand2")
-        self._bw = width
-        self.var = var
-        self.lo, self.hi, self.jump = lo, hi, jump
-        self.command = command
-        self._dragging = False
-        self._draw()
-        self.bind("<Button-1>", self._on_press)
-        self.bind("<B1-Motion>", self._on_move)
-        self.bind("<ButtonRelease-1>", self._on_release)
-        if var is not None:
-            var.trace_add("write", lambda *a: self._draw())
-
-    def _ratio(self):
-        span = (self.hi - self.lo) or 1
+    def _from_entry(self, *args):
         try:
-            v = float(self.var.get())
-        except Exception:
-            v = self.lo
-        return max(0.0, min(1.0, (v - self.lo) / span))
+            value = float(self.variable.get())
+        except (tk.TclError, ValueError):
+            return  # Allow partially typed numbers; generation validates the complete value.
+        self._syncing = True
+        try:
+            self._position.set(max(self.low, min(self.high, value)))
+        finally:
+            self._syncing = False
 
-    def _draw(self):
-        self.delete("all")
-        x0 = self.PAD
-        x1 = self._bw - self.PAD
-        self.create_line(x0, self.CY, x1, self.CY, width=4,
-                         fill=STROKE, capstyle="round")
-        cx = x0 + (x1 - x0) * self._ratio()
-        if cx > x0:
-            self.create_line(x0, self.CY, cx, self.CY, width=4,
-                             fill=ACCENT, capstyle="round")
-        self.create_oval(cx - 7, self.CY - 7, cx + 7, self.CY + 7,
-                         fill="#FAFAFA", outline=ACCENT, width=2)
+    def _keyboard_step(self, direction):
+        if str(self.slider.cget("state")) != "disabled":
+            self._from_slider(str(self._position.get() + self.step * direction))
+        return "break"
 
-    def _value_at(self, x):
-        x0 = self.PAD
-        x1 = self._bw - self.PAD
-        r = max(0.0, min(1.0, (x - x0) / max(1, x1 - x0)))
-        v = self.lo + r * (self.hi - self.lo)
-        if self.jump:
-            v = round(v / self.jump) * self.jump
-        v = max(self.lo, min(self.hi, v))
-        if isinstance(self.var, IntVar) or (self.jump >= 1 and float(v).is_integer()):
-            return int(round(v))
-        return round(v, 2)
+    def _update_enabled(self, *args):
+        state = "normal" if self._enabled is None or self._enabled.get() else "disabled"
+        self.entry.configure(state=state)
+        self.slider.configure(state=state)
 
-    def _on_press(self, event):
-        self._dragging = True
-        self.var.set(self._value_at(event.x))
-        self._draw()
-
-    def _on_move(self, event):
-        if not self._dragging:
-            return
-        self.var.set(self._value_at(event.x))
-        self._draw()
-
-    def _on_release(self, event):
-        if not self._dragging:
-            return
-        self._dragging = False
-        if self.command:
-            self.command()
+    def _cleanup(self, event):
+        if event.widget is self:
+            self.variable.trace_remove("write", self._trace)
+            if self._enabled_trace:
+                self._enabled.trace_remove("write", self._enabled_trace)
 
 
 class App(tk.Tk):
     def __init__(self):
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "Hurkin.Margin.QR.1")
-        except Exception:
-            pass
         super().__init__()
         self.title("Margin")
         self.configure(bg=BG)
-        self.resizable(False, False)
-        self.geometry(f"{W}x{H}+{max(0,(self.winfo_screenwidth()-W)//2)}+"
-                      f"{max(0,(self.winfo_screenheight()-H)//2-20)}")
+        self.geometry("1100x820")
+        self.minsize(960, 700)
         self._set_icon()
         self._dark_titlebar()
-
-        self.text = StringVar(value="www.hurkin.top")
-        self.art = StringVar(value="Hurkin")
-        self.version = StringVar(value="自动")
-        self.ec = StringVar(value="H")
-        self.budget = IntVar(value=10)
-        self.dot = DoubleVar(value=0.66)
-        self.font_choice = StringVar(value=FONT_CHOICES[0][0])
-
-        self._img = None
-        self._photo = None
-        self._stats = None
-
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._cancel = threading.Event()
+        self._revision = 0
+        self._job = None
+        self._timer = None
+        self._stats = self._img = None
+        self._photos = {}
+        self._font_specs = []
+        self._closed = False
+        self.text = tk.StringVar(value="www.hurkin.top")
+        self.art = tk.StringVar(value="Hurkin")
+        self.source = tk.StringVar(value="文字")
+        self.family = tk.StringVar()
+        self.face = tk.StringVar()
+        self.image_path = tk.StringVar()
+        self.image_mode = tk.StringVar(value="自动")
+        self.threshold = tk.IntVar(value=128)
+        self.manual_threshold = tk.BooleanVar(value=False)
+        self.contrast = tk.DoubleVar(value=1.0)
+        self.invert = tk.BooleanVar(value=False)
+        self.crop = tk.BooleanVar(value=True)
+        self.white_threshold = tk.IntVar(value=245)
+        self.ratio = tk.DoubleVar(value=0.62)
+        self.version = tk.StringVar(value="自动")
+        self.ec = tk.StringVar(value="H")
+        self.mask = tk.StringVar(value="自动")
+        self.budget = tk.IntVar(value=10)
+        self.dot = tk.DoubleVar(value=0.66)
+        self.strategy = tk.StringVar(value="扫码优先")
+        self.advanced = tk.BooleanVar(value=False)
         self._styles()
         self._build()
-        self.after(150, self.on_generate)
+        for var in (self.text, self.art, self.source, self.family, self.face, self.image_path,
+                    self.image_mode, self.threshold, self.manual_threshold, self.contrast, self.invert, self.crop,
+                    self.white_threshold, self.ratio, self.version, self.ec, self.mask,
+                    self.budget, self.dot, self.strategy):
+            var.trace_add("write", self.schedule)
+        self._font_job = self._executor.submit(fonts.installed_fonts)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._poll_timer = self.after(50, self._poll)
+        self.bind("<Control-Return>", lambda e: self.on_generate())
 
-    # ------------------------------------------------------------ 外观
     def _set_icon(self):
         ico = resource_path("assets", "margin.ico")
         try:
@@ -225,7 +142,7 @@ class App(tk.Tk):
             pass
         try:
             png = Image.open(resource_path("assets", "margin.png")).convert("RGBA")
-            self._icons = [ImageTk.PhotoImage(png.resize((s, s), Image.LANCZOS))
+            self._icons = [ImageTk.PhotoImage(png.resize((s, s), Image.Resampling.LANCZOS))
                            for s in (256, 128, 64, 48, 32, 16)]
             self.iconphoto(True, *self._icons)
         except Exception:
@@ -257,208 +174,430 @@ class App(tk.Tk):
             u32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
         except Exception:
             pass
-
     def _styles(self):
-        st = ttk.Style(self)
-        try:
-            st.theme_use("clam")
-        except Exception:
-            pass
-        st.configure("Dark.TCombobox",
-                     fieldbackground=FIELD, background=CARD, foreground=TEXT,
-                     arrowcolor=SUB, bordercolor=STROKE, lightcolor=STROKE,
-                     darkcolor=STROKE, selectbackground=FIELD,
-                     selectforeground=TEXT, padding=4)
-        st.map("Dark.TCombobox",
-               fieldbackground=[("readonly", FIELD)],
-               foreground=[("readonly", TEXT)],
-               bordercolor=[("focus", ACCENT)])
-        self.option_add("*TCombobox*Listbox.background", CARD)
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TFrame", background=CARD)
+        style.configure("Root.TFrame", background=BG)
+        style.configure("TLabel", background=CARD, foreground=TEXT, font=("Microsoft YaHei UI", 10))
+        style.configure("Sub.TLabel", foreground=SUB, font=("Microsoft YaHei UI", 9))
+        style.configure("Title.TLabel", background=BG, font=("Segoe UI", 22, "bold"))
+        style.configure("TButton", background=STROKE, foreground=TEXT, padding=(12, 8),
+                        font=("Microsoft YaHei UI", 10), borderwidth=0)
+        style.map("TButton", background=[("active", "#3F3F46"), ("disabled", FIELD)],
+                  foreground=[("disabled", "#71717A")])
+        style.configure("Primary.TButton", background=ACCENT)
+        style.map("Primary.TButton", background=[("active", "#4F46E5")])
+        style.configure("TEntry", fieldbackground=FIELD, foreground=TEXT, insertcolor=TEXT,
+                        padding=7, bordercolor=STROKE)
+        style.configure("TCombobox", fieldbackground=FIELD, background=STROKE, foreground=TEXT,
+                        arrowcolor=SUB, padding=6, bordercolor=STROKE)
+        style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", TEXT)])
+        style.configure("TCheckbutton", background=CARD, foreground=TEXT, font=("Microsoft YaHei UI", 10))
+        style.configure("TRadiobutton", background=CARD, foreground=TEXT, font=("Microsoft YaHei UI", 10))
+        for name in ("TCheckbutton", "TRadiobutton"):
+            style.map(name, background=[("active", CARD)])
+        style.configure("TSpinbox", fieldbackground=FIELD, foreground=TEXT, padding=6,
+                        arrowcolor=TEXT, background=STROKE)
+        style.configure("Vertical.TScrollbar", background=STROKE, troughcolor=CARD, borderwidth=0)
+        style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=FIELD, borderwidth=0)
+        style.configure("Horizontal.TScale", background=CARD, troughcolor=FIELD)
+        self.option_add("*TCombobox*Listbox.background", FIELD)
         self.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
-        self.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
-        self.option_add("*TCombobox*Listbox.borderWidth", 0)
+        self.option_add("*Font", ("Microsoft YaHei UI", 10))
 
-    # ------------------------------------------------------------ 布局
-    def _label(self, x, y, text, color=SUB, size=9, bold=False, anchor="w"):
-        return self.cv.create_text(x, y, text=text, fill=color, anchor=anchor,
-                                   font=("Microsoft YaHei UI", size,
-                                         "bold" if bold else "normal"))
+    def _label(self, parent, text, row, col=0):
+        ttk.Label(parent, text=text, style="Sub.TLabel").grid(row=row, column=col, sticky="w", pady=(10, 4))
 
-    def _entry(self, x, y, w, var, font_size=10, h=32):
-        holder = tk.Frame(self.cv, bg=STROKE)
-        e = tk.Entry(holder, textvariable=var, bg=FIELD, fg=TEXT,
-                     insertbackground=ACCENT, relief="flat", bd=0,
-                     font=("Microsoft YaHei UI", font_size),
-                     highlightthickness=0)
-        e.pack(padx=1, pady=1, fill="both", expand=True)
-        self.cv.create_window(x, y, window=holder, anchor="nw", width=w, height=h)
-        return e
+    def _entry(self, parent, var, row):
+        widget = ttk.Entry(parent, textvariable=var)
+        widget.grid(row=row, column=0, sticky="ew")
+        return widget
 
-    def _combo(self, x, y, w, var, values, h=32):
-        cb = ttk.Combobox(self.cv, textvariable=var, values=values,
-                          state="readonly", style="Dark.TCombobox",
-                          font=("Microsoft YaHei UI", 9))
-        self.cv.create_window(x, y, window=cb, anchor="nw", width=w, height=h)
-        return cb
+    def _combo(self, parent, var, values, row, editable=False):
+        widget = ttk.Combobox(parent, textvariable=var, values=values,
+                              state="normal" if editable else "readonly")
+        widget.grid(row=row, column=0, sticky="ew")
+        return widget
 
-    def _scale(self, x, y, w, var, lo, hi, jump=1):
-        s = MiniSlider(self.cv, width=w, var=var, lo=lo, hi=hi, jump=jump,
-                       command=self.on_generate)
-        self.cv.create_window(x, y, window=s, anchor="w")
-        return s
+    def _number(self, parent, label, var, low, high, step, row, **options):
+        control = NumberControl(parent, label, var, low, high, step, **options)
+        control.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(12, 4))
+        return control
 
     def _build(self):
-        cv = tk.Canvas(self, width=W, height=H, bg=BG, highlightthickness=0, bd=0)
-        cv.place(x=0, y=0)
-        self.cv = cv
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        header = ttk.Frame(self, style="Root.TFrame", padding=(24, 14))
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="Margin", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="用纠错余量，让图案融入二维码", background=BG,
+                  foreground=SUB).pack(side="left", padx=20)
+        body = ttk.Frame(self, style="Root.TFrame", padding=(24, 0, 24, 10))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=2, minsize=350)
+        body.columnconfigure(1, weight=3, minsize=470)
+        left = ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(left, bg=CARD, highlightthickness=0, width=360)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        settings = ttk.Frame(canvas, padding=18)
+        window = canvas.create_window(0, 0, window=settings, anchor="nw")
+        settings.columnconfigure(0, weight=1)
+        settings.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        def wheel(event):
+            if str(event.widget).startswith(str(left)):
+                canvas.yview_scroll(-int(event.delta / 120), "units")
+        self.bind_all("<MouseWheel>", wheel, add="+")
+        self._label(settings, "扫码后显示的内容", 0)
+        self._entry(settings, self.text, 1)
+        row = ttk.Frame(settings)
+        row.grid(row=2, column=0, sticky="w", pady=(18, 6))
+        ttk.Label(row, text="中心图案", style="Sub.TLabel").pack(side="left", padx=(0, 18))
+        for value in ("文字", "图片"):
+            ttk.Radiobutton(row, text=value, variable=self.source, value=value,
+                            command=self._show_source).pack(side="left", padx=(0, 18))
+        self.text_panel = ttk.Frame(settings)
+        self.text_panel.grid(row=3, column=0, sticky="ew")
+        self.text_panel.columnconfigure(0, weight=1)
+        self._entry(self.text_panel, self.art, 0)
+        self._label(self.text_panel, "字体 · 可输入名称搜索", 1)
+        self.font_combo = self._combo(self.text_panel, self.family, [], 2, editable=True)
+        self.font_combo.bind("<KeyRelease>", self._filter_fonts)
+        self.font_combo.bind("<<ComboboxSelected>>", self._family_selected)
+        self._label(self.text_panel, "字形", 3)
+        self.face_combo = self._combo(self.text_panel, self.face, [], 4)
+        ttk.Button(self.text_panel, text="选择字体文件…", command=self.choose_font).grid(
+            row=5, column=0, sticky="ew", pady=(10, 0))
+        self.font_hint = ttk.Label(self.text_panel, text="正在读取系统字体…", style="Sub.TLabel", wraplength=300)
+        self.font_hint.grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.image_panel = ttk.Frame(settings)
+        self.image_panel.columnconfigure(0, weight=1)
+        ttk.Button(self.image_panel, text="选择图片…", command=self.choose_image).grid(row=0, column=0, sticky="ew")
+        ttk.Label(self.image_panel, textvariable=self.image_path, style="Sub.TLabel", wraplength=290).grid(
+            row=1, column=0, sticky="w", pady=(6, 0))
+        self._label(self.image_panel, "黑白处理", 2)
+        self._combo(self.image_panel, self.image_mode, ["自动", "Logo", "照片"], 3)
+        ttk.Checkbutton(self.image_panel, text="裁掉外围白边 / 透明边", variable=self.crop).grid(
+            row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(self.image_panel, text="反色", variable=self.invert).grid(row=5, column=0, sticky="w")
+        ttk.Checkbutton(self.image_panel, text="图片高级设置", variable=self.advanced,
+                         command=self._show_advanced).grid(row=6, column=0, sticky="w", pady=(8, 0))
+        self.advanced_panel = ttk.Frame(self.image_panel)
+        self.advanced_panel.columnconfigure(0, weight=1)
+        ttk.Checkbutton(self.advanced_panel, text="手动黑白阈值（关闭时自动）",
+                         variable=self.manual_threshold).grid(row=0, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self._number(self.advanced_panel, "黑白阈值", self.threshold, 0, 255, 1, 1,
+                     enabled=self.manual_threshold)
+        self._number(self.advanced_panel, "对比度", self.contrast, 0.2, 4, 0.1, 2)
+        self._number(self.advanced_panel, "白边阈值", self.white_threshold, 1, 255, 1, 3)
+        ttk.Button(self.advanced_panel, text="重置图片设置", command=self.reset_image).grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self._label(settings, "生成策略", 4)
+        self._combo(settings, self.strategy, ["扫码优先", "还原优先"], 5)
+        ttk.Label(settings, text="扫码优先保留更多纠错余量；还原优先会比较更高版本。",
+                  style="Sub.TLabel", wraplength=300).grid(row=6, column=0, sticky="w", pady=(6, 4))
+        parameters = ttk.Frame(settings)
+        parameters.grid(row=7, column=0, sticky="ew")
+        parameters.columnconfigure(0, weight=1)
+        self._label(parameters, "二维码版本", 0)
+        ttk.Combobox(parameters, textvariable=self.version, values=["自动"] + list(range(1, 41)),
+                      state="readonly", width=10).grid(row=0, column=1, sticky="e", pady=(10, 4))
+        self._label(parameters, "纠错等级", 1)
+        ttk.Combobox(parameters, textvariable=self.ec, values=["H", "Q", "M", "L"],
+                      state="readonly", width=10).grid(row=1, column=1, sticky="e", pady=(10, 4))
+        self._number(parameters, "每块预算上限", self.budget, 0, 15, 1, 2)
+        self._number(parameters, "图案宽度占比", self.ratio, 0.1, 0.8, 0.02, 3)
+        self._number(parameters, "点径", self.dot, 0.4, 1.0, 0.02, 4)
+        self._label(parameters, "掩码", 5)
+        ttk.Combobox(parameters, textvariable=self.mask, values=["自动"] + list(range(8)),
+                      state="readonly", width=10).grid(row=5, column=1, sticky="e", pady=(10, 4))
+        preview_panel = ttk.Frame(body, padding=20)
+        preview_panel.grid(row=0, column=1, sticky="nsew")
+        preview_panel.columnconfigure(0, weight=1)
+        preview_panel.rowconfigure(2, weight=1)
+        self.previews = ttk.Frame(preview_panel)
+        for i, (name, label) in enumerate((("original", "原图"), ("target", "黑白处理 · 保留原图细节"))):
+            self.previews.columnconfigure(i, weight=1)
+            panel = ttk.Frame(self.previews)
+            panel.grid(row=0, column=i, sticky="nsew", padx=6)
+            ttk.Label(panel, text=label, style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+            widget = tk.Label(panel, bg=FIELD, fg=SUB, text="选择图片后显示", width=20, height=6)
+            widget.pack(fill="both", expand=True)
+            setattr(self, name + "_preview", widget)
+        ttk.Label(preview_panel, text="二维码预览", style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=(12, 8))
+        self.preview = tk.Label(preview_panel, bg=CARD, fg=SUB, text="正在准备…")
+        self.preview.grid(row=2, column=0, sticky="nsew")
+        self.preview.bind("<Configure>", self._resize_preview)
+        self.details = ttk.Label(preview_panel, text="", style="Sub.TLabel", wraplength=430, justify="left")
+        self.details.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        footer = ttk.Frame(self, style="Root.TFrame", padding=(24, 0, 24, 16))
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        actions = ttk.Frame(footer, style="Root.TFrame")
+        actions.grid(row=0, column=0, sticky="w")
+        ttk.Button(actions, text="生成", style="Primary.TButton", command=self.on_generate).pack(side="left", padx=(0, 8))
+        self.save_png = ttk.Button(actions, text="保存 PNG", command=self.on_save, state="disabled")
+        self.save_png.pack(side="left", padx=(0, 8))
+        self.save_svg = ttk.Button(actions, text="保存 SVG", command=self.on_save_svg, state="disabled")
+        self.save_svg.pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="复制参数", command=self.copy_stats).pack(side="left")
+        self.progress = ttk.Progressbar(footer, mode="indeterminate", length=110)
+        self.progress.grid(row=0, column=1, sticky="e")
+        self.status = ttk.Label(footer, text="读取字体中…", background=BG, foreground=SUB, wraplength=960)
+        self.status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
-        cv.create_text(24, 26, text="Margin", fill=TEXT, anchor="w",
-                       font=("Segoe UI", 20, "bold"))
+    def _show_source(self):
+        image = self.source.get() == "图片"
+        if image:
+            self.text_panel.grid_remove()
+            self.image_panel.grid(row=3, column=0, sticky="ew")
+            self.previews.grid(row=0, column=0, sticky="ew")
+        else:
+            self.image_panel.grid_remove()
+            self.text_panel.grid()
+            self.previews.grid_remove()
 
-        # 卡片一：设置
-        rounded_polygon(cv, 24, 60, W - 24, 224, 14, fill=CARD, outline=STROKE)
-        self._label(44, 94, "扫码后显示的内容")
-        self._entry(160, 78, 700, self.text)
+    def _show_advanced(self):
+        if self.advanced.get():
+            self.advanced_panel.grid(row=7, column=0, sticky="ew")
+        else:
+            self.advanced_panel.grid_remove()
 
-        self._label(44, 138, "中心图案")
-        e_art = self._entry(160, 122, 186, self.art)
-        e_art.bind("<KeyRelease>", lambda e: self.on_generate())
-        self._label(370, 138, "字体")
-        cb_font = self._combo(412, 122, 190, self.font_choice,
-                              [n for n, _ in FONT_CHOICES])
-        cb_font.bind("<<ComboboxSelected>>", lambda e: self.on_generate())
+    def _filter_fonts(self, event=None):
+        query = self.family.get().casefold()
+        values = sorted({s.family for s in self._font_specs if query in s.family.casefold()}, key=str.casefold)
+        self.font_combo.configure(values=values)
+        self._family_selected()
 
-        # 第三行：版本 / 纠错 / 每块预算 / 点径
-        self._label(44, 194, "版本")
-        cb_ver = self._combo(88, 178, 76, self.version,
-                             ["自动"] + [str(v) for v in range(6, 26)])
-        cb_ver.bind("<<ComboboxSelected>>", lambda e: self.on_generate())
+    def _family_selected(self, event=None):
+        faces = list(dict.fromkeys(s.style for s in self._font_specs if s.family == self.family.get()))
+        self.face_combo.configure(values=faces)
+        if self.face.get() not in faces:
+            self.face.set(faces[0] if faces else "")
 
-        self._label(186, 194, "纠错")
-        cb_ec = self._combo(226, 178, 62, self.ec, ["H", "Q", "M"])
-        cb_ec.bind("<<ComboboxSelected>>", lambda e: self.on_generate())
+    def choose_font(self):
+        path = filedialog.askopenfilename(title="选择字体文件", filetypes=[("字体文件", "*.ttf *.otf *.ttc *.otc")])
+        if not path:
+            return
+        try:
+            imported = fonts.file_fonts(path)
+        except ValueError as exc:
+            self._set_hint(str(exc), WARN)
+            return
+        self._font_specs = imported + self._font_specs
+        self.family.set(imported[0].family)
+        self._filter_fonts()
+        self.face.set(imported[0].style)
+        self.font_hint.configure(text=f"已载入 {os.path.basename(path)} · {len(imported)} 个字形")
 
-        self._label(310, 194, "每块预算")
-        sc1 = self._scale(388, 194, 108, self.budget, 2, 14, 1)
-        self._budget_text = cv.create_text(
-            508, 192, text=str(self.budget.get()), fill=TEXT, anchor="w",
-            font=("Segoe UI", 10, "bold"))
-        self.budget.trace_add(
-            "write", lambda *a: cv.itemconfigure(self._budget_text,
-                                                 text=str(self.budget.get())))
-        sc1.bind("<ButtonRelease-1>", lambda e: self.on_generate())
+    def choose_image(self):
+        path = filedialog.askopenfilename(title="选择中心图案", filetypes=[
+            ("图片文件", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("所有文件", "*.*")])
+        if path:
+            self.image_path.set(path)
 
-        self._label(556, 194, "点径")
-        sc2 = self._scale(594, 194, 108, self.dot, 0.40, 1.0, 0.02)
-        self._dot_text = cv.create_text(
-            712, 192, text=f"{self.dot.get():.2f}", fill=TEXT, anchor="w",
-            font=("Segoe UI", 10, "bold"))
-        self.dot.trace_add(
-            "write", lambda *a: cv.itemconfigure(self._dot_text,
-                                                 text=f"{self.dot.get():.2f}"))
-        sc2.bind("<ButtonRelease-1>", lambda e: self.on_generate())
+    def reset_image(self):
+        for var, value in ((self.image_mode, "自动"), (self.threshold, 128), (self.manual_threshold, False),
+                           (self.contrast, 1.0), (self.invert, False), (self.crop, True),
+                           (self.white_threshold, 245), (self.ratio, 0.62)):
+            var.set(value)
 
-        # 卡片二：预览
-        rounded_polygon(cv, 24, 236, W - 24, 648, 14, fill=CARD, outline=STROKE)
-        self.preview = tk.Label(cv, bg=CARD, bd=0, highlightthickness=0)
-        cv.create_window(W / 2, 442, window=self.preview, anchor="center")
+    def _set_hint(self, text, color=SUB):
+        self.status.configure(text=text, foreground=color)
 
-        # 底部按钮
-        self.btn_gen = Pill(cv, "生成", self.on_generate, kind="primary", height=40)
-        cv.create_window(24, 668, window=self.btn_gen, anchor="nw")
-        x = 24 + self.btn_gen._bw + 10
-        b2 = Pill(cv, "保存 PNG", self.on_save, height=40)
-        cv.create_window(x, 668, window=b2, anchor="nw")
-        x += b2._bw + 10
-        b3 = Pill(cv, "保存 SVG", self.on_save_svg, height=40)
-        cv.create_window(x, 668, window=b3, anchor="nw")
-        x += b3._bw + 10
-        b4 = Pill(cv, "复制参数", self.copy_stats, height=40)
-        cv.create_window(x, 668, window=b4, anchor="nw")
-        for b in (self.btn_gen, b2, b3, b4):
-            b._bind_events()
+    def schedule(self, *args):
+        self._revision += 1
+        self._cancel.set()
+        self._stats = self._img = None
+        self.save_png.configure(state="disabled")
+        self.save_svg.configure(state="disabled")
+        self.preview.configure(image="", text="等待生成…")
+        self.details.configure(text="")
+        self._set_hint("参数已更新，等待生成…")
+        self._show_source()
+        if self._timer:
+            self.after_cancel(self._timer)
+        self._timer = self.after(350, self.on_generate)
 
-        self.hint_text = cv.create_text(26, 730, text="", fill=OK, anchor="w",
-                                        font=("Microsoft YaHei UI", 9))
+    def _arguments(self):
+        image = self.source.get() == "图片"
+        if image and not self.image_path.get():
+            raise ValueError("请先选择一张中心图案图片")
+        spec = None
+        if not image and self.art.get().strip():
+            spec = next((s for s in self._font_specs if s.family == self.family.get() and s.style == self.face.get()), None)
+            if spec is None:
+                raise ValueError("请选择列表中的字体及字形，或导入字体文件")
+        try:
+            def integer(variable):
+                raw = str(self.getvar(variable._name))
+                return int(raw)
 
-    # ------------------------------------------------------------ 行为
-    def _font_path(self):
-        for name, path in FONT_CHOICES:
-            if name == self.font_choice.get():
-                return path
-        return None
-
-    def _set_hint(self, msg, color=OK):
-        self.cv.itemconfigure(self.hint_text, text=msg, fill=color)
+            options = ImageOptions()
+            budget = integer(self.budget)
+            if not 0 <= budget <= 15:
+                raise ValueError("预算需在 0–15 之间")
+            if image:
+                options = ImageOptions(
+                    {"自动": "auto", "Logo": "logo", "照片": "photo"}[self.image_mode.get()],
+                    integer(self.threshold) if self.manual_threshold.get() else None,
+                    self.contrast.get(), self.invert.get(), self.crop.get(), integer(self.white_threshold))
+            return dict(text=self.text.get().strip(), art="" if image else self.art.get().strip(),
+                        image_path=self.image_path.get() if image else None, font_spec=spec,
+                        version=None if self.version.get() == "自动" else int(self.version.get()),
+                        ec=self.ec.get(), mask=None if self.mask.get() == "自动" else int(self.mask.get()),
+                        budget=budget, dot=self.dot.get(), art_ratio=self.ratio.get(),
+                        strategy="scan" if self.strategy.get() == "扫码优先" else "fidelity",
+                        image_options=options)
+        except (ValueError, tk.TclError) as exc:
+            raise ValueError("请检查数值输入，预算与阈值需为整数，其余数值需在滑块范围内") from exc
 
     def on_generate(self):
-        ver = None if self.version.get() == "自动" else int(self.version.get())
-        raw = self.text.get().strip()
-        try:
-            img, stats = core.generate(
-                self.text.get().strip(), self.art.get().strip(),
-                version=ver, ec=self.ec.get(), budget=int(self.budget.get()),
-                dot=float(self.dot.get()), scale=20, quiet=4,
-                font_path=self._font_path())
-        except Exception:
-            self._img = None
-            self.preview.configure(image="")
-            self._photo = None
-            self._set_hint("内容放不进这个版本，换个版本或缩短内容", WARN)
+        if self._timer:
+            self.after_cancel(self._timer)
+            self._timer = None
+        if self._font_job is not None:
             return
+        self._cancel.set()
+        self._cancel = threading.Event()
+        self._revision += 1
+        self._stats = self._img = None
+        self.save_png.configure(state="disabled")
+        self.save_svg.configure(state="disabled")
+        self.details.configure(text="")
+        if self._job:
+            self._job[1].cancel()
+        try:
+            args = self._arguments()
+        except ValueError as exc:
+            self._set_hint(str(exc), WARN)
+            self.progress.stop()
+            self.preview.configure(image="", text="检查设置后重新生成")
+            return
+        self._job = (self._revision, self._executor.submit(core.generate, **args, cancel=self._cancel))
+        self.progress.start(12)
+        self.preview.configure(image="", text="正在生成并检查扫码…")
+        self._set_hint("正在比较图案和掩码，界面可继续操作…")
 
-        self._img = img
-        self._stats = stats
-        thumb = img.convert("RGBA").resize((PREVIEW, PREVIEW), Image.NEAREST)
-        thumb = rounded_image(thumb, 18)
-        plate = Image.new("RGBA", (PREVIEW + 8, PREVIEW + 8), (0, 0, 0, 0))
-        plate.paste(thumb, (4, 4), thumb)
-        self._photo = ImageTk.PhotoImage(plate)
-        self.preview.configure(image=self._photo, width=PREVIEW + 8, height=PREVIEW + 8)
+    def _poll(self):
+        self._poll_timer = None
+        if self._closed:
+            return
+        if self._font_job is not None and self._font_job.done():
+            try:
+                self._font_specs.extend(self._font_job.result())
+                if not self.family.get():
+                    default = fonts.default_font()
+                    self._font_specs.append(default)
+                    self.family.set(default.family)
+                    self._filter_fonts()
+                    self.face.set(default.style)
+                self.font_hint.configure(text=f"{len({f.family for f in self._font_specs})} 种字体 · 支持系统及当前用户字体")
+            except Exception as exc:
+                self._set_hint(f"读取字体失败：{exc}；可选择字体文件", WARN)
+            self._font_job = None
+            self.schedule()
+        if self._job and self._job[1].done():
+            revision, job = self._job
+            self._job = None
+            if revision == self._revision:
+                self.progress.stop()
+                try:
+                    self._img, self._stats = job.result()
+                    self._show_result()
+                except CancelledError:
+                    pass
+                except Exception as exc:
+                    self._stats = self._img = None
+                    self.preview.configure(image="", text="生成失败")
+                    self._set_hint(str(exc), WARN)
+        self._poll_timer = self.after(60, self._poll)
 
-        fixed = stats.text if stats.text != raw else ""
-        tail = f"（已自动补全为 {stats.text}）" if fixed else ""
-        if not stats.decode:
-            self._set_hint("已生成 · 未做扫码自检" + tail, SUB)
-        elif stats.ok:
-            self._set_hint("已生成 · 自检可扫描" + tail, OK)
+    def _thumbnail(self, name, image, size, nearest=False):
+        thumb = ImageOps.contain(image.convert("RGB"), size,
+                                 Image.Resampling.NEAREST if nearest else Image.Resampling.LANCZOS)
+        plate = Image.new("RGB", size, "white")
+        plate.paste(thumb, ((size[0] - thumb.width) // 2, (size[1] - thumb.height) // 2))
+        photo = ImageTk.PhotoImage(plate)
+        self._photos[name] = photo
+        widget = self.preview if name == "qr" else getattr(self, name + "_preview")
+        widget.configure(image=photo, text="", width=0, height=0)
+
+    def _resize_preview(self, event=None):
+        if self._img is not None:
+            side = max(100, min(480, self.preview.winfo_width() - 8, self.preview.winfo_height() - 8))
+            self._thumbnail("qr", self._img, (side, side), True)
+
+    def _show_result(self):
+        stats = self._stats
+        self._resize_preview()
+        if stats.original is not None:
+            self._thumbnail("original", stats.original, (180, 120))
+            self._thumbnail("target", stats.processed, (180, 120))
+        self.details.configure(text=stats.summary())
+        can_save = stats.ok or not stats.verified
+        for button in (self.save_png, self.save_svg):
+            button.configure(state="normal" if can_save else "disabled")
+        if stats.ok:
+            self._set_hint(f"自检可扫描 · 有效预算 {stats.budget}/{stats.capacity} · 图案一致度 {stats.fidelity:.0%} · {stats.text}", OK)
+        elif not stats.verified:
+            self._set_hint("已生成，但未安装 zxing-cpp，扫码能力未验证", WARN)
         else:
-            self._set_hint("自检未通过，已自动降低预算，可再调小预算", WARN)
+            self._set_hint("扫码自检失败，无法保存。请增大点径、提高版本或缩小图案。", WARN)
+
+    def _save(self, extension):
+        if self._stats is None or (self._stats.verified and not self._stats.ok):
+            return
+        path = filedialog.asksaveasfilename(defaultextension=extension,
+            filetypes=[(extension[1:].upper(), "*" + extension)], initialfile="margin" + extension)
+        if path:
+            try:
+                if extension == ".svg":
+                    svg.write_svg(path, "", result=self._stats)
+                else:
+                    self._img.save(path)
+                self._set_hint(f"已保存 {os.path.basename(path)}", OK)
+            except OSError as exc:
+                self._set_hint(f"保存失败：{exc}", WARN)
 
     def on_save(self):
-        if self._img is None:
-            self._set_hint("先生成一张二维码", WARN)
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png", filetypes=[("PNG 图片", "*.png")],
-            initialfile="margin.png")
-        if path:
-            self._img.save(path)
-            self._set_hint(f"已保存 {os.path.basename(path)}", OK)
+        self._save(".png")
 
     def on_save_svg(self):
-        if self._stats is None:
-            self._set_hint("先生成一张二维码", WARN)
-            return
-        from . import svg
-        path = filedialog.asksaveasfilename(
-            defaultextension=".svg", filetypes=[("SVG 矢量图", "*.svg")],
-            initialfile="margin.svg")
-        if path:
-            svg.write_svg(path, self.text.get().strip(), self.art.get().strip(),
-                          None if self.version.get() == "自动" else int(self.version.get()),
-                          self.ec.get(), int(self.budget.get()),
-                          float(self.dot.get()), self._font_path())
-            self._set_hint(f"已保存 {os.path.basename(path)}", OK)
+        self._save(".svg")
 
     def copy_stats(self):
+        try:
+            values = self._arguments()
+        except ValueError as exc:
+            self._set_hint(str(exc), WARN)
+            return
+        lines = [f"{key}: {value}" for key, value in values.items() if value is not None]
+        if self._stats:
+            lines.append("实际生成结果：\n" + self._stats.summary())
         self.clipboard_clear()
-        self.clipboard_append(
-            f"内容: {self.text.get()}\n图案: {self.art.get()}\n"
-            f"版本: {self.version.get()} 纠错: {self.ec.get()} "
-            f"预算: {self.budget.get()} 点径: {self.dot.get()}")
-        self._set_hint("参数已复制到剪贴板", SUB)
+        self.clipboard_append("\n".join(lines))
+        self._set_hint("参数已复制到剪贴板")
+
+    def close(self):
+        self._closed = True
+        self._cancel.set()
+        if self._timer:
+            self.after_cancel(self._timer)
+        if self._poll_timer:
+            self.after_cancel(self._poll_timer)
+        self.progress.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self.destroy()
 
 
 def main():

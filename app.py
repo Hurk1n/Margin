@@ -19,21 +19,41 @@ def cli(argv):
     ap.add_argument("-a", "--art", default="", help="中心像素图案（文字）")
     ap.add_argument("-o", "--out", default="margin.png", help="输出 PNG 路径")
     ap.add_argument("--svg", default="", help="额外输出 SVG 路径")
-    ap.add_argument("--version", type=int, default=None, help="版本 6-40，默认自动")
-    ap.add_argument("--ec", default="H", help="纠错等级 H/Q/M（默认 H）")
+    ap.add_argument("--version", type=int, default=None, help="版本 1-40，默认自动")
+    ap.add_argument("--ec", default="H", help="纠错等级 H/Q/M/L（默认 H）")
     ap.add_argument("--mask", type=int, default=None, help="掩码 0-7，默认自动")
     ap.add_argument("--budget", type=int, default=10, help="每块纠错码字预算（默认 10）")
     ap.add_argument("--dot", type=float, default=0.66, help="点径 0.4-1.0")
     ap.add_argument("--scale", type=int, default=20, help="每模块像素")
     ap.add_argument("--quiet", type=int, default=4, help="静区模块数")
     ap.add_argument("--font", default="", help="字体文件路径")
+    ap.add_argument("--font-index", type=int, default=0, help="字体集合中的字形索引")
+    ap.add_argument("--image", default=None, help="中心图案图片路径（与 --art 互斥）")
+    ap.add_argument("--image-mode", choices=("auto", "logo", "photo"), default="auto")
+    ap.add_argument("--threshold", type=int, default=None, help="黑白阈值，默认自动")
+    ap.add_argument("--contrast", type=float, default=1.0, help="图片对比度 0.2–4")
+    ap.add_argument("--invert", action="store_true", help="反转图片黑白")
+    ap.add_argument("--no-crop", action="store_true", help="不裁掉外围白边")
+    ap.add_argument("--white-threshold", type=int, default=245, help="裁白边阈值 1–255")
+    ap.add_argument("--strategy", choices=("scan", "fidelity"), default="scan")
     ap.add_argument("--ratio", type=float, default=0.62, help="图案最大宽度占比")
     args = ap.parse_args(argv)
-
-    img, stats = core.generate(
-        args.text, args.art, version=args.version, ec=args.ec, mask=args.mask,
-        budget=args.budget, dot=args.dot, scale=args.scale, quiet=args.quiet,
-        font_path=args.font or None, art_ratio=args.ratio)
+    if args.art and args.image:
+        ap.error("--art 与 --image 只能选择一种")
+    from margin.art import ImageOptions
+    try:
+        img, stats = core.generate(
+            args.text, args.art, version=args.version, ec=args.ec, mask=args.mask,
+            budget=args.budget, dot=args.dot, scale=args.scale, quiet=args.quiet,
+            font_path=args.font or None, art_ratio=args.ratio,
+            font_index=args.font_index, image_path=args.image, strategy=args.strategy,
+            image_options=ImageOptions(args.image_mode, args.threshold, args.contrast,
+                                       args.invert, not args.no_crop, args.white_threshold))
+    except (ValueError, OSError) as exc:
+        ap.error(str(exc))
+    if stats.verified and not stats.ok:
+        print(stats.summary())
+        return 2
     for _p in (args.out, args.svg):
         if _p:
             d = os.path.dirname(os.path.abspath(_p))
@@ -43,10 +63,10 @@ def cli(argv):
     if args.svg:
         from margin import svg
         svg.write_svg(args.svg, args.text, args.art, args.version, args.ec,
-                      args.budget, args.dot, args.font or None, args.quiet)
+                      args.budget, args.dot, args.font or None, args.quiet, result=stats)
         print(f"已保存: {os.path.abspath(args.svg)}")
     print(stats.summary())
-    return 0 if (stats.ok or not stats.decode) else 2
+    return 0 if (stats.ok or not stats.verified) else 2
 
 
 def selftest():
