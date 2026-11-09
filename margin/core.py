@@ -10,7 +10,11 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Optional
+from concurrent.futures import CancelledError
+
+from .art import ImageOptions, detail_preview, grid_from_gray, prepare_image
+from .fonts import FontSpec, render_text
 
 import numpy as np
 import segno
@@ -21,7 +25,7 @@ try:  # 可选：用于生成后的自检
 except Exception:  # pragma: no cover
     zxingcpp = None
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 EC_TABLE_KEY = {"L": 1, "M": 0, "H": 2, "Q": 3}
 
@@ -160,59 +164,25 @@ def build_structure(version: int, ec: str) -> Structure:
 
 
 def pick_font(font_path: Optional[str] = None) -> Optional[str]:
-    if font_path and os.path.exists(font_path):
+    if font_path:
+        if not os.path.isfile(font_path):
+            raise ValueError(f"字体文件不存在：{font_path}")
         return font_path
-    for p in FONT_CANDIDATES:
-        if os.path.exists(p):
-            return p
+    for path in FONT_CANDIDATES:
+        if os.path.isfile(path):
+            return path
     return None
 
 
 def art_grid(art: str, n: int, font_path: Optional[str] = None,
              max_width_ratio: float = 0.62, max_height_ratio: float = 0.42):
-    """把文字渲染成 n x n 的模块网格（True = 深色）。"""
+    """Compatibility helper returning the text target and its grayscale grid."""
     if not art:
-        return np.zeros((n, n), dtype=bool), np.zeros((n, n), np.float32)
-    S = 48
-    H = n * S
-    img = Image.new("L", (H, H), 255)
-    d = ImageDraw.Draw(img)
-    fpath = pick_font(font_path)
-    # 自适应字号：先按宽度上限，再按高度上限
-    lo, hi = 4, H
-    best = None
-    for _ in range(28):
-        fs = (lo + hi) // 2
-        font = ImageFont.truetype(fpath, fs) if fpath else ImageFont.load_default()
-        try:
-            bbox = d.textbbox((0, 0), art, font=font, spacing=0)
-        except Exception:
-            bbox = (0, 0, fs * len(art), fs)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        if tw <= H * max_width_ratio and th <= H * max_height_ratio:
-            best = (fs, bbox, tw, th)
-            lo = fs + 1
-        else:
-            hi = fs - 1
-        if lo > hi:
-            break
-    if best is None:
-        fs = max(6, int(H * 0.18))
-        font = ImageFont.truetype(fpath, fs) if fpath else ImageFont.load_default()
-        bbox = d.textbbox((0, 0), art, font=font)
-    else:
-        fs, bbox, tw, th = best
-        font = ImageFont.truetype(fpath, fs) if fpath else ImageFont.load_default()
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = (H - tw) / 2 - bbox[0]
-    y = (H - th) / 2 - bbox[1]
-    d.text((x, y), art, font=font, fill=0)
-
-    small = img.resize((n, n), Image.LANCZOS)
-    gray = np.array(small).astype(np.float32)
-    thr = 128
-    return gray < thr, gray
-
+        return np.zeros((n, n), dtype=bool), np.full((n, n), 255, np.float32)
+    spec = FontSpec("", path=font_path) if font_path else None
+    image = render_text(art, spec)
+    grid = grid_from_gray(image, n, max_width_ratio, max_height_ratio=max_height_ratio)
+    return grid.dark, grid.gray
 
 
 def alignment_mask(st: Structure) -> np.ndarray:
@@ -278,115 +248,233 @@ class Stats:
     decode: list = field(default_factory=list)
     ok: bool = False
     ratio: float = 0.0
+    verified: bool = False
+    fidelity: float = 1.0
+    strategy: str = "scan"
+    image_mode: str = ""
+    matrix: Optional[np.ndarray] = field(default=None, repr=False)
+    structure: Optional[Structure] = field(default=None, repr=False)
+    target: Optional[np.ndarray] = field(default=None, repr=False)
+    original: Optional[Image.Image] = field(default=None, repr=False)
+    processed: Optional[Image.Image] = field(default=None, repr=False)
+    dot: float = 0.66
+    quiet: int = 4
 
     def summary(self) -> str:
-        blocks = " ".join(f"{v}" for _, v in sorted(self.per_block.items()))
-        dec = "成功" if self.ok else ("未验证" if not self.decode else "失败")
+        blocks = " ".join(str(v) for _, v in sorted(self.per_block.items()))
+        dec = "成功" if self.ok else ("失败" if self.verified else "未验证（未安装 zxing-cpp）")
+        strategy = "扫码优先" if self.strategy == "scan" else "还原优先"
+        processing = f" · 图片模式 {self.image_mode}" if self.image_mode else ""
         return (f"v{self.version} · {self.modules}×{self.modules} · {self.ec}级 · mask{self.mask}\n"
                 f"改写 {self.changed_modules} 个模块，占用 {self.error_codewords} 个纠错码字\n"
-                f"各块用量 {blocks}（上限 {self.capacity}）· 预算占比 {self.ratio:.0%}\n"
+                f"各块用量 {blocks}（容量 {self.capacity} / 有效预算 {self.budget}）\n"
+                f"预算占比 {self.ratio:.0%} · 图案一致度 {self.fidelity:.0%}\n"
+                f"{strategy}{processing}\n"
                 f"扫码自检：{dec}")
+
+
+def _validate(text, art, image_path, ec, budget, ratio, strategy, version, mask):
+    if not text or not text.strip():
+        raise ValueError("扫码内容不能为空")
+    if art and image_path is not None:
+        raise ValueError("中心文字与图片只能选择一种")
+    if ec not in EC_TABLE_KEY:
+        raise ValueError("纠错等级必须为 H、Q、M 或 L")
+    if not isinstance(budget, int) or budget < 0:
+        raise ValueError("纠错预算必须为非负整数")
+    if not 0.1 <= ratio <= 0.8:
+        raise ValueError("图案尺寸占比必须在 0.1–0.8 之间")
+    if strategy not in ("scan", "fidelity"):
+        raise ValueError("生成策略必须为 scan 或 fidelity")
+    if version is not None and (not isinstance(version, int) or not 1 <= version <= 40):
+        raise ValueError("二维码版本必须在 1–40 之间")
+    if mask is not None and (not isinstance(mask, int) or not 0 <= mask <= 7):
+        raise ValueError("掩码必须在 0–7 之间")
+
+
+def _seed(text, ec):
+    return segno.make(text, error=ec, boost_error=False, micro=False)
+
+
+def _qr_candidates(text, ec, version, mask):
+    qr = segno.make(text, error=ec, version=version, mask=mask,
+                     boost_error=False, micro=False)
+    if mask is not None:
+        return [qr]
+    # Keep the QR library's standard penalty winner when art scores tie.
+    return [qr] + [segno.make(text, error=ec, version=version, mask=m,
+                              boost_error=False, micro=False)
+                    for m in range(8) if m != qr.mask]
+
+
+def _start_version(seed, art, image_path, version):
+    if version is not None:
+        if version < seed.version:
+            raise ValueError("内容放不进这个版本，请提高版本或缩短内容")
+        return version
+    minimum = 12 if image_path is not None else (15 if len(art) > 8 else 12 if len(art) > 4 else 10)
+    return max(seed.version, minimum) if art or image_path is not None else seed.version
+
+
+def _source(art, image_path, image_options, font_path, font_index, font_spec):
+    if font_index < 0:
+        raise ValueError("字体索引不能为负数")
+    if image_path is not None:
+        original, prepared = prepare_image(image_path, image_options)
+        return original, prepared
+    if art:
+        spec = font_spec or (FontSpec("", path=font_path, index=font_index) if font_path else None)
+        return None, render_text(art, spec)
+    return None, None
+
+
+def _grid(prepared, n, ratio, options, is_image, st):
+    if prepared is None:
+        return None
+    grid = grid_from_gray(prepared, n, ratio, options.mode if is_image else "text",
+                          options.threshold if is_image else None)
+    _, _, shift = shift_art(grid.dark, grid.gray, st)
+    if shift != (0, 0):
+        for name in ("dark", "gray", "region", "weights"):
+            setattr(grid, name, np.roll(getattr(grid, name), shift, axis=(0, 1)))
+    return grid
+
+
+def _effective_budget(st, requested, strategy):
+    ceiling = int(st.capacity * 0.7) if strategy == "scan" else max(0, st.capacity - 1)
+    return min(requested, ceiling)
+
+
+def _apply(qr, st, grid, budget):
+    matrix = np.array(qr.matrix, dtype=np.uint8)
+    if grid is None:
+        return matrix, {}, 0, 1.0
+    # A changed codeword costs one error regardless of how many of its bits change.
+    # Rank entire codewords by recoverable visual detail, independently per RS block.
+    groups = {}
+    for k, (r, c) in enumerate(st.path[:len(st.cw_owner) * 8]):
+        if grid.region[r, c] and bool(matrix[r, c]) != grid.dark[r, c]:
+            groups.setdefault(k // 8, []).append((r, c))
+    ranked = {}
+    for cw, cells in groups.items():
+        score = sum(float(grid.weights[r, c]) for r, c in cells)
+        ranked.setdefault(st.cw_owner[cw], []).append((score, cw, cells))
+    used, applied = {}, 0
+    for block, choices in ranked.items():
+        chosen = sorted(choices, key=lambda item: (-item[0], item[1]))[:budget]
+        used[block] = len(chosen)
+        for _, _, cells in chosen:
+            for r, c in cells:
+                matrix[r, c] = grid.dark[r, c]
+                applied += 1
+    weights = grid.weights * grid.region
+    fidelity = float(np.sum(weights * (matrix == grid.dark)) / max(float(weights.sum()), 1))
+    return matrix, used, applied, fidelity
 
 
 def build_matrix(text: str, art: str = "", version: Optional[int] = None,
                  ec: str = "H", mask: Optional[int] = None, budget: int = 10,
-                 font_path: Optional[str] = None, art_ratio: float = 0.62):
-    """构造最终模块矩阵（含中心图案改写）。
-
-    返回 (M, Structure, used, mask, changed_modules)
-    """
-    if not text:
-        raise ValueError("内容不能为空")
-    text = normalize_payload(text)
-    ec = ec.upper()
-    seed = segno.make(text, error=ec, boost_error=False)
-    if version is None:
-        if art:
-            # 图案越长，需要越多模块来画字：4 字符内 v10，5-8 字符 v12，更长 v15
-            need = 12 if len(art) > 4 else 10
-            if len(art) > 8:
-                need = 15
-            version = max(seed.version, need)
-        else:
-            version = seed.version
+                 font_path: Optional[str] = None, art_ratio: float = 0.62, *,
+                 image_path=None, image_options=None, font_index=0, font_spec=None,
+                 strategy="scan"):
+    """Build a budget-limited matrix. The legacy five-item return is preserved."""
+    text, ec = normalize_payload(text), ec.upper()
+    _validate(text, art, image_path, ec, budget, art_ratio, strategy, version, mask)
+    options = image_options or ImageOptions()
+    options.validate()
+    seed = _seed(text, ec)
+    version = _start_version(seed, art, image_path, version)
     st = build_structure(version, ec)
-
-    qr = (segno.make(text, error=ec, version=version, mask=mask, boost_error=False)
-          if mask is not None else
-          segno.make(text, error=ec, version=version, boost_error=False))
-    M = np.array([[1 if v else 0 for v in row] for row in qr.matrix], dtype=np.uint8)
-    n = st.n
-    pos_index = {rc: k for k, rc in enumerate(st.path)}
-    used = {}
-    applied = 0
-
-    if art:
-        P, gray = art_grid(art, n, font_path,
-                           max_width_ratio=art_ratio,
-                           max_height_ratio=art_ratio * 0.72)
-        P, gray, _shift = shift_art(P, gray, st)
-        cand = np.argwhere((~st.fm) & (P.astype(bool) != M.astype(bool)))
-        # 距离场：触摸到笔画的可能性（膨胀 + 模糊），让"该变白"的点也有优先级
-        from PIL import ImageFilter
-        base = Image.fromarray((P * 255).astype(np.uint8))
-        near = base
-        for _ in range(3):
-            near = near.filter(ImageFilter.MaxFilter(5))
-        near = near.filter(ImageFilter.GaussianBlur(2))
-        near = np.array(near).astype(np.float32)
-        # 笔画内（P=1）绝对优先，其次才是靠近笔画的空白
-        score = np.where(P, 300.0 + (255.0 - gray), near * 0.9)
-        order = sorted(((score[r, c], int(r), int(c)) for r, c in cand), reverse=True)
-        changed = {}
-        for _s, r, c in order:
-            k = pos_index[(r, c)]
-            cw = k // 8
-            bi = st.cw_owner[cw]
-            cur = changed.get(bi, set())
-            if len(cur | {cw}) > budget:
-                continue
-            changed[bi] = cur | {cw}
-            M[r, c] = P[r, c]
-            applied += 1
-        used = {bi: len(v) for bi, v in changed.items()}
-    return M, st, used, qr.mask, applied
+    _, prepared = _source(art, image_path, options, font_path, font_index, font_spec)
+    grid = _grid(prepared, st.n, art_ratio, options, image_path is not None, st)
+    effective = _effective_budget(st, budget, strategy)
+    candidates = []
+    for qr in _qr_candidates(text, ec, version, mask):
+        matrix, used, applied, fidelity = _apply(qr, st, grid, effective)
+        candidates.append((fidelity, matrix, used, applied, qr.mask))
+    _, matrix, used, applied, chosen_mask = max(candidates, key=lambda item: item[0])
+    return matrix, st, used, chosen_mask, applied
 
 
 def generate(text: str, art: str = "", version: Optional[int] = None,
              ec: str = "H", mask: Optional[int] = None, budget: int = 10,
              dot: float = 0.66, scale: int = 20, quiet: int = 4,
              font_path: Optional[str] = None,
-             auto_retry: bool = True, art_ratio: float = 0.62):
-    """生成中心带像素图案的二维码。返回 (PIL.Image, Stats)。"""
-    text = normalize_payload(text)
-    M, st, used, used_mask, applied = build_matrix(
-        text, art, version, ec, mask, budget, font_path, art_ratio)
-    img = render(M, st, dot=dot, scale=scale, quiet=quiet)
-
-    stats = Stats(text=text, art=art, version=st.version, modules=st.n, ec=st.ec,
-                  mask=used_mask, budget=budget, capacity=st.capacity,
-                  changed_modules=applied,
-                  error_codewords=sum(used.values()),
-                  per_block={i: used.get(i, 0) for i in range(st.block_count)},
-                  ratio=(sum(used.values()) / (st.capacity * st.block_count))
-                  if st.capacity else 0.0)
-
-    if zxingcpp is not None:
-        stats.decode = [b.text for b in
-                        zxingcpp.read_barcodes(np.array(img.convert("L")))]
-        stats.ok = stats.text in stats.decode
-
-    # 自检失败 -> 自动降预算重试，取第一个能扫出来的
-    if auto_retry and art and not stats.ok and budget > 4:
-        for b in (budget - 2, budget - 4, 6, 4):
-            if b <= 0 or b >= budget:
-                continue
-            im2, st2 = generate(text, art, version=version, ec=ec, mask=mask, budget=b,
-                                dot=dot, scale=scale, quiet=quiet, font_path=font_path,
-                                auto_retry=False, art_ratio=art_ratio)
-            if st2.ok:
-                return im2, st2
-    return img, stats
+             auto_retry: bool = True, art_ratio: float = 0.62, *,
+             image_path=None, image_options=None, font_index=0, font_spec=None,
+             strategy="scan", cancel=None):
+    """Return (PNG image, Stats), including the exact final matrix for SVG export."""
+    text, ec = normalize_payload(text), ec.upper()
+    _validate(text, art, image_path, ec, budget, art_ratio, strategy, version, mask)
+    if (not 0.4 <= dot <= 1 or not isinstance(scale, int) or scale < 1
+            or not isinstance(quiet, int) or quiet < 4):
+        raise ValueError("点径需为 0.4–1，像素需大于 0，静区至少为 4")
+    options = image_options or ImageOptions()
+    options.validate()
+    seed = _seed(text, ec)
+    first = _start_version(seed, art, image_path, version)
+    versions = sorted({min(40, first + step) for step in (0, 3, 6)}) if image_path is not None and version is None else [first]
+    if cancel is not None and cancel.is_set():
+        raise CancelledError()
+    original, prepared = _source(art, image_path, options, font_path, font_index, font_spec)
+    previews = {}
+    best, fallback = None, None
+    for current in versions:
+        st = build_structure(current, ec)
+        grid = _grid(prepared, st.n, art_ratio, options, image_path is not None, st)
+        processed = None
+        if grid is not None and image_path is not None:
+            if grid.mode not in previews:
+                previews[grid.mode] = detail_preview(prepared, grid.mode, options.threshold)
+            processed = previews[grid.mode]
+        limit = _effective_budget(st, budget, strategy)
+        budgets = [limit]
+        if auto_retry and grid is not None and zxingcpp is not None:
+            budgets += list(range(limit - 2, -1, -2))
+            if 0 not in budgets:
+                budgets.append(0)
+        qr_candidates = _qr_candidates(text, ec, current, mask)
+        for effective in budgets:
+            if cancel is not None and cancel.is_set():
+                raise CancelledError()
+            candidates = []
+            for qr in qr_candidates:
+                matrix, used, applied, fidelity = _apply(qr, st, grid, effective)
+                candidates.append((fidelity, qr, matrix, used, applied))
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            passed = False
+            for fidelity, qr, matrix, used, applied in candidates:
+                if cancel is not None and cancel.is_set():
+                    raise CancelledError()
+                img = render(matrix, st, dot=dot, scale=scale, quiet=quiet)
+                stats = Stats(text=text, art=art, version=current, modules=st.n, ec=ec,
+                              mask=qr.mask, budget=effective, capacity=st.capacity,
+                              changed_modules=applied, error_codewords=sum(used.values()),
+                              per_block={i: used.get(i, 0) for i in range(st.block_count)},
+                              ratio=sum(used.values()) / (st.capacity * st.block_count),
+                              fidelity=fidelity, strategy=strategy,
+                              image_mode=grid.mode if grid is not None and image_path is not None else "",
+                              matrix=matrix, structure=st,
+                              target=grid.dark if grid is not None else None,
+                              original=original, processed=processed, dot=dot, quiet=quiet)
+                if zxingcpp is not None:
+                    stats.verified = True
+                    stats.decode = [b.text for b in zxingcpp.read_barcodes(np.array(img.convert("L")))]
+                    stats.ok = text in stats.decode
+                result = (img, stats)
+                if fallback is None or fidelity > fallback[1].fidelity:
+                    fallback = result
+                if stats.ok or not stats.verified:
+                    passed = True
+                    if best is None or fidelity > best[1].fidelity:
+                        best = result
+                    # All masks were compared above. Decode the highest-fidelity passing one.
+                    break
+            if passed:
+                break  # Lower budgets cannot recover more of the target.
+        if best is not None and strategy == "scan":
+            break
+    return best or fallback
 
 
 def render(M: np.ndarray, st: Structure, dot: float = 0.66, scale: int = 20,
